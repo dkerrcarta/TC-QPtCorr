@@ -21,15 +21,28 @@
  *                                                                         *
  ***************************************************************************/
 """
+from pathlib import Path
+import pandas as pd
+import sys
+import os.path
+
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
+from qgis.core import QgsProject, QgsVectorLayer, QgsVectorLayerJoinInfo, QgsProject, QgsExpression, Qgis, QgsField
+from PyQt5.QtWidgets import QAbstractItemView, QAction, QMessageBox
+from PyQt5.QtCore import QVariant
 
 # Initialize Qt resources from file resources.py
 from .resources import *
 # Import the code for the dialog
 from .point_correction_dialog import PointCorrectionDialog
-import os.path
+
+BASE_DIR = Path(__file__).resolve().parent
+CSV = BASE_DIR.joinpath('csv/classes.csv')
+CSV_POINTS = BASE_DIR.joinpath('csv/classes_for_points.csv')
+CSV_AREAS = BASE_DIR.joinpath('csv/hatitat_tile_intersection_areas.csv')
+RULE_CSV = BASE_DIR.joinpath('csv/ruleID.csv')
 
 
 class PointCorrection:
@@ -179,6 +192,115 @@ class PointCorrection:
                 action)
             self.iface.removeToolBarIcon(action)
 
+    def check_if_file_is_shp(self, layer_shp):
+        """Returns true if multipolygon shapefile"""
+        shp = True
+        if not layer_shp.geometryType() == 2:
+            shp = False
+        return shp
+
+    def check_if_file_is_pt(self, layer_pt):
+        """Returns true if point shapfile"""
+        points = True
+        if not layer_pt.geometryType() == 0:
+            points = False
+        return points
+
+
+    def join_to_pt_and_extract(self, layer, pt_lyr):
+        """Extract interpretation values to points"""
+        shp = 'HabitatSub'
+        pt = 'Correction'
+        f = pt_lyr.fields().indexFromName(pt)
+        f_ = layer.fields().indexFromName(shp)
+        pt_lyr.startEditing()
+        for feature_x in pt_lyr.getFeatures():
+            for feature_y in layer.getFeatures():
+                if feature_y.geometry().intersects(feature_x.geometry()):
+                    pt_lyr.changeAttributeValue(feature_x.id(), f, feature_y[f_])
+        pt_lyr.commitChanges()
+
+    def calculate_stats(self, folder, layer_pt):
+        csv = folder.joinpath(f'{layer_pt.name()}_accuracy.csv')
+        print(csv)
+        print(csv.exists())
+        if not csv.exists():
+            QMessageBox.critical(self.iface.mainWindow(),
+                            f'Error! ',
+                            f"Could not find {layer_pt.name()}_accuracy.csv in which to save statistics. Please put this csv in the same folder as the point and area shapefiles and rerun.")
+        else:
+            int_field = 'Correction'
+            qc_field = 'QC_subnum'
+            int_ = layer_pt.fields().indexFromName(int_field)
+            qc = layer_pt.fields().indexFromName(qc_field)
+            matching_values_counter = 0
+            no_rows = layer_pt.featureCount()
+            for feature in layer_pt.getFeatures():
+                if feature[int_] == feature[qc]:
+                    matching_values_counter += 1
+            accuracy = (matching_values_counter/no_rows) * 100
+            df = pd.read_csv(csv)
+            df['Second_run_accuracy%'] = accuracy
+            first_accuracy = df['First_run_accuracy%'].tolist()
+            df.to_csv(csv, index=False)
+            return accuracy, first_accuracy[0]
+
+    def join_rule_id_to_shp(self, layer_shp):
+        print('joining')
+        ruleID_csv = QgsVectorLayer(f'file:///{str(RULE_CSV)}?delimiter=,','classes','delimitedtext')
+        QgsProject.instance().addMapLayer(ruleID_csv)
+        csv_field = 'HabitatSub'
+        shp_field = 'HabitatSub'
+        joinObject = QgsVectorLayerJoinInfo()
+        joinObject.setJoinFieldName(shp_field)
+        joinObject.setTargetFieldName(csv_field)
+        joinObject.setJoinLayerId(ruleID_csv.id())
+        joinObject.setUsingMemoryCache(True)
+        joinObject.setJoinLayer(ruleID_csv)
+        layer_shp.addJoin(joinObject)
+        layer_shp.startEditing()
+        field = QgsField('RuleID', QVariant.Int)
+        if layer_shp.fields().indexFromName('RuleID') == -1:
+            layer_shp.dataProvider().addAttributes([field])
+            layer_shp.updateFields()
+        idx = layer_shp.fields().indexFromName('RuleID')
+        idx_join = layer_shp.fields().indexFromName('classes_RuleID_csv')
+        print(idx_join)
+        for feature in layer_shp.getFeatures():
+            layer_shp.changeAttributeValue(feature.id(), idx, feature[idx_join])
+            layer_shp.updateFields()
+        #layer_shp.dataProvider().deleteAttributes([idx_join])
+        layer_shp.commitChanges()
+        layer_shp.removeJoin(ruleID_csv.id())
+        QgsProject.instance().removeMapLayer(ruleID_csv)
+        layer_shp.commitChanges()
+
+
+
+
+
+    def fill_correction_field(self, layer_shp, layer_pt):
+        filename = Path(layer_shp.source().split('|')[0]).resolve()
+        if filename.exists():
+            folder = filename.parent
+            if self.check_if_file_is_shp(layer_shp) and self.check_if_file_is_pt(layer_pt):
+                self.join_to_pt_and_extract(layer_shp, layer_pt)
+                accuracy, first_accuracy = self.calculate_stats(folder, layer_pt)
+                self.join_rule_id_to_shp(layer_shp)
+                QMessageBox.information(self.iface.mainWindow(),
+                                'Success',
+                                f"Point shapefile saved successfully. Interpretation accuracy has changed from - {first_accuracy}% to {accuracy}%")
+
+            else:
+                QMessageBox.critical(self.iface.mainWindow(),
+                            f'Error! ',
+                            "The wrong shapefile formats have been loaded. Please try again.")
+
+        else:
+            QMessageBox.critical(self.iface.mainWindow(),
+                            f'Error! Layer {layer_shp.name()} not saved',
+                            "Please save the selected layer before continuing.")
+
 
     def run(self):
         """Run method that performs all the real work"""
@@ -189,12 +311,22 @@ class PointCorrection:
             self.first_start = False
             self.dlg = PointCorrectionDialog()
 
+        layers = QgsProject.instance().layerTreeRoot().children()
+        # Clear the contents of the comboBox from previous runs
+        self.dlg.comboBox.clear()
+        self.dlg.comboBox_2.clear()
+        # Populate the comboBox with names of all the loaded layers
+        self.dlg.comboBox.addItems([layer.name() for layer in layers])
+        self.dlg.comboBox_2.addItems([layer.name() for layer in layers])
         # show the dialog
         self.dlg.show()
         # Run the dialog event loop
         result = self.dlg.exec_()
         # See if OK was pressed
         if result:
-            # Do something useful here - delete the line containing pass and
-            # substitute with your code.
-            pass
+            selected_layer_index_shp = self.dlg.comboBox.currentIndex()
+            selected_layer_shp = layers[selected_layer_index_shp].layer()
+            selected_layer_index_pt = self.dlg.comboBox_2.currentIndex()
+            selected_layer_pt = layers[selected_layer_index_pt].layer()
+            self.fill_correction_field(selected_layer_shp, selected_layer_pt)
+            
